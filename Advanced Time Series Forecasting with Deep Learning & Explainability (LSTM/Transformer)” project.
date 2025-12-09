@@ -1,0 +1,411 @@
+"""
+Advanced Time Series Forecasting with Deep Learning and Explainability
+(LSTM + Transformer + Baseline + SHAP)
+
+NOTE:
+- Install these first:
+    pip install numpy pandas scikit-learn tensorflow statsmodels shap matplotlib
+
+- Edit the CONFIG section (dataset path & column names) before running.
+"""
+
+# ======================
+# 0. IMPORTS
+# ======================
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import train_test_split
+
+import tensorflow as tf
+from tensorflow.keras import layers, models
+from tensorflow.keras.callbacks import EarlyStopping
+
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
+
+import shap
+import os
+
+# Make results reproducible
+SEED = 42
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
+
+# ======================
+# 1. CONFIGURATION
+# ======================
+DATA_PATH   = "data.csv"    # <- change this to your dataset file
+TIME_COL    = "timestamp"   # <- change to your time column name
+TARGET_COL  = "target"      # <- change to your target column name
+
+# Forecasting settings
+SEQ_LEN     = 48     # input sequence length (e.g., last 48 hours)
+HORIZON     = 1      # forecast 1 step ahead
+
+TEST_SIZE   = 0.2    # last 20% as test
+VAL_SIZE    = 0.2    # from remaining, 20% as validation
+
+BATCH_SIZE  = 64
+EPOCHS      = 50
+
+# ======================
+# 2. LOAD & PREPROCESS DATA
+# ======================
+print("Loading data...")
+df = pd.read_csv(DATA_PATH)
+
+# parse datetime
+df[TIME_COL] = pd.to_datetime(df[TIME_COL])
+df = df.sort_values(TIME_COL).reset_index(drop=True)
+
+# Optional: set index
+df.set_index(TIME_COL, inplace=True)
+
+# Handle missing values (simple forward fill)
+df = df.ffill().bfill()
+
+print("Data shape:", df.shape)
+print(df.head())
+
+# ======================
+# 3. FEATURE ENGINEERING
+# ======================
+# You can add more lag / rolling / calendar features here
+
+def add_time_features(dataframe):
+    df_feat = dataframe.copy()
+    df_feat["hour"] = df_feat.index.hour
+    df_feat["dayofweek"] = df_feat.index.dayofweek
+    df_feat["month"] = df_feat.index.month
+    return df_feat
+
+df = add_time_features(df)
+
+# Separate features and target
+y = df[TARGET_COL].values.reshape(-1, 1)
+X = df.drop(columns=[TARGET_COL]).values
+
+# Scale features and target
+x_scaler = MinMaxScaler()
+y_scaler = MinMaxScaler()
+
+X_scaled = x_scaler.fit_transform(X)
+y_scaled = y_scaler.fit_transform(y)
+
+# ======================
+# 4. CREATE SEQUENCES (WINDOWING)
+# ======================
+def create_sequences(X, y, seq_len=24, horizon=1):
+    Xs, ys = [], []
+    for i in range(len(X) - seq_len - horizon + 1):
+        Xs.append(X[i : i + seq_len])
+        ys.append(y[i + seq_len + horizon - 1])  # last step as label
+    return np.array(Xs), np.array(ys)
+
+X_seq, y_seq = create_sequences(X_scaled, y_scaled, SEQ_LEN, HORIZON)
+print("Sequence X shape:", X_seq.shape)
+print("Sequence y shape:", y_seq.shape)
+
+# ======================
+# 5. TRAIN / VAL / TEST SPLIT (TIME BASED)
+# ======================
+n_total = len(X_seq)
+n_test = int(n_total * TEST_SIZE)
+
+X_trainval, X_test = X_seq[:-n_test], X_seq[-n_test:]
+y_trainval, y_test = y_seq[:-n_test], y_seq[-n_test:]
+
+n_val = int(len(X_trainval) * VAL_SIZE)
+
+X_train, X_val = X_trainval[:-n_val], X_trainval[-n_val:]
+y_train, y_val = y_trainval[:-n_val], y_trainval[-n_val:]
+
+print("Train:", X_train.shape, "Val:", X_val.shape, "Test:", X_test.shape)
+
+# ======================
+# 6. BASELINE MODEL (EXPONENTIAL SMOOTHING + NAIVE)
+# ======================
+# We'll build baseline only on the target series (not scaled)
+
+def mase(y_true, y_pred, y_insample, m=1):
+    # MASE: Mean Absolute Scaled Error
+    n = y_insample.shape[0]
+    d = np.abs(y_insample[m:] - y_insample[:-m]).mean()
+    errors = np.abs(y_true - y_pred)
+    return errors.mean() / d
+
+# Prepare in-sample series (original scale)
+y_insample = y[-(n_test + len(y_trainval)) : -(n_test)]  # last part before test
+y_insample = y_insample.flatten()
+
+# Naive forecast: last observed value
+y_test_true = y_scaler.inverse_transform(y_test)
+y_naive_pred = np.repeat(y_insample[-1], len(y_test_true)).reshape(-1, 1)
+
+# Exponential Smoothing baseline
+end_train_index = len(y) - len(y_test_true)
+y_train_full = y[:end_train_index].flatten()
+
+hw_model = ExponentialSmoothing(
+    y_train_full,
+    trend="add",
+    seasonal=None
+).fit()
+
+y_hw_pred = hw_model.forecast(len(y_test_true)).reshape(-1, 1)
+
+# ======================
+# 7. METRICS FUNCTIONS
+# ======================
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+
+def rmse(y_true, y_pred):
+    return np.sqrt(mean_squared_error(y_true, y_pred))
+
+def mape(y_true, y_pred):
+    return np.mean(np.abs((y_true - y_pred) / (y_true + 1e-8))) * 100
+
+def compute_metrics(name, y_true, y_pred, y_insample):
+    _rmse = rmse(y_true, y_pred)
+    _mae  = mean_absolute_error(y_true, y_pred)
+    _mape = mape(y_true, y_pred)
+    _mase = mase(y_true.flatten(), y_pred.flatten(), y_insample.flatten())
+    print(f"\n{name} results:")
+    print(f"RMSE: { _rmse:.4f}")
+    print(f"MAE : { _mae:.4f}")
+    print(f"MAPE: { _mape:.4f}")
+    print(f"MASE: { _mase:.4f}")
+    return {"RMSE": _rmse, "MAE": _mae, "MAPE": _mape, "MASE": _mase}
+
+print("\n=== BASELINE METRICS ===")
+baseline_results = {}
+baseline_results["Naive"] = compute_metrics(
+    "Naive",
+    y_test_true,
+    y_naive_pred,
+    y_insample
+)
+baseline_results["ExpSmooth"] = compute_metrics(
+    "Exponential Smoothing",
+    y_test_true,
+    y_hw_pred,
+    y_insample
+)
+
+# ======================
+# 8. LSTM MODEL
+# ======================
+def build_lstm_model(input_shape):
+    model = models.Sequential([
+        layers.Input(shape=input_shape),
+        layers.LSTM(64, return_sequences=True),
+        layers.Dropout(0.2),
+        layers.LSTM(32),
+        layers.Dropout(0.2),
+        layers.Dense(1, activation="linear")
+    ])
+    model.compile(
+        loss="mse",
+        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
+        metrics=["mae"]
+    )
+    return model
+
+lstm_model = build_lstm_model(X_train.shape[1:])
+lstm_model.summary()
+
+early_stop = EarlyStopping(
+    monitor="val_loss",
+    patience=5,
+    restore_best_weights=True
+)
+
+print("\nTraining LSTM...")
+history_lstm = lstm_model.fit(
+    X_train, y_train,
+    validation_data=(X_val, y_val),
+    epochs=EPOCHS,
+    batch_size=BATCH_SIZE,
+    callbacks=[early_stop],
+    verbose=1
+)
+
+# Evaluate on test set
+y_test_pred_lstm_scaled = lstm_model.predict(X_test)
+y_test_pred_lstm = y_scaler.inverse_transform(y_test_pred_lstm_scaled)
+
+print("\n=== LSTM METRICS ===")
+lstm_results = compute_metrics(
+    "LSTM",
+    y_test_true,
+    y_test_pred_lstm,
+    y_insample
+)
+
+# ======================
+# 9. TRANSFORMER MODEL
+# ======================
+# Simple Transformer encoder block
+class TransformerBlock(layers.Layer):
+    def __init__(self, embed_dim, num_heads, ff_dim, rate=0.1):
+        super().__init__()
+        self.att = layers.MultiHeadAttention(num_heads=num_heads, key_dim=embed_dim)
+        self.ffn = tf.keras.Sequential([
+            layers.Dense(ff_dim, activation="relu"),
+            layers.Dense(embed_dim),
+        ])
+        self.layernorm1 = layers.LayerNormalization(epsilon=1e-6)
+        self.layernorm2 = layers.LayerNormalization(epsilon=1e-6)
+        self.dropout1 = layers.Dropout(rate)
+        self.dropout2 = layers.Dropout(rate)
+
+    def call(self, inputs, training=False):
+        attn_output = self.att(inputs, inputs)
+        attn_output = self.dropout1(attn_output, training=training)
+        out1 = self.layernorm1(inputs + attn_output)
+        ffn_output = self.ffn(out1)
+        ffn_output = self.dropout2(ffn_output, training=training)
+        return self.layernorm2(out1 + ffn_output)
+
+def build_transformer_model(input_shape, embed_dim=64, num_heads=4, ff_dim=128):
+    inputs = layers.Input(shape=input_shape)
+    # Linear projection to embedding dimension
+    x = layers.Dense(embed_dim)(inputs)
+
+    # Positional encoding (simple learnable)
+    positions = tf.range(start=0, limit=input_shape[0], delta=1)
+    pos_embedding = layers.Embedding(input_dim=input_shape[0], output_dim=embed_dim)(positions)
+    x = x + pos_embedding
+
+    x = TransformerBlock(embed_dim, num_heads, ff_dim)(x)
+    x = layers.GlobalAveragePooling1D()(x)
+    x = layers.Dropout(0.2)(x)
+    x = layers.Dense(32, activation="relu")(x)
+    outputs = layers.Dense(1, activation="linear")(x)
+
+    model = models.Model(inputs=inputs, outputs=outputs)
+    model.compile(
+        loss="mse",
+        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
+        metrics=["mae"]
+    )
+    return model
+
+transformer_model = build_transformer_model(X_train.shape[1:])
+transformer_model.summary()
+
+print("\nTraining Transformer...")
+history_trans = transformer_model.fit(
+    X_train, y_train,
+    validation_data=(X_val, y_val),
+    epochs=EPOCHS,
+    batch_size=BATCH_SIZE,
+    callbacks=[early_stop],
+    verbose=1
+)
+
+# Evaluate on test set
+y_test_pred_trans_scaled = transformer_model.predict(X_test)
+y_test_pred_trans = y_scaler.inverse_transform(y_test_pred_trans_scaled)
+
+print("\n=== TRANSFORMER METRICS ===")
+trans_results = compute_metrics(
+    "Transformer",
+    y_test_true,
+    y_test_pred_trans,
+    y_insample
+)
+
+# ======================
+# 10. PLOT PREDICTIONS
+# ======================
+plt.figure(figsize=(12, 5))
+plt.plot(y_test_true[:200], label="True")
+plt.plot(y_test_pred_lstm[:200], label="LSTM")
+plt.plot(y_test_pred_trans[:200], label="Transformer")
+plt.legend()
+plt.title("Prediction vs Truth (first 200 test points)")
+plt.xlabel("Time step")
+plt.ylabel("Target")
+plt.tight_layout()
+plt.show()
+
+# ======================
+# 11. SHAP EXPLAINABILITY (LSTM EXAMPLE)
+# ======================
+# NOTE: DeepExplainer works best on smaller background sets (for speed)
+print("\nComputing SHAP values for LSTM (this can be slow)...")
+
+# convert to tensors (required by DeepExplainer)
+background = X_train[:200]   # small background
+test_sample = X_test[:50]    # explain first 50 samples
+
+# Some TF + SHAP versions might need this:
+tf.keras.backend.clear_session()
+
+explainer = shap.DeepExplainer(lstm_model, background)
+shap_values = explainer.shap_values(test_sample)  # list with one array for output
+
+shap_values_array = shap_values[0]  # shape: (samples, seq_len, features)
+
+# summarize importance across time dimension
+shap_importance_features = np.mean(np.abs(shap_values_array), axis=1)   # (samples, features)
+mean_feature_importance = shap_importance_features.mean(axis=0)        # (features,)
+
+feature_names = df.drop(columns=[TARGET_COL]).columns.tolist()
+
+# Plot feature importance
+shap_importance_df = pd.DataFrame({
+    "feature": feature_names,
+    "importance": mean_feature_importance
+}).sort_values("importance", ascending=False)
+
+plt.figure(figsize=(10, 6))
+plt.barh(shap_importance_df["feature"], shap_importance_df["importance"])
+plt.gca().invert_yaxis()
+plt.title("SHAP Feature Importance (LSTM)")
+plt.xlabel("Mean |SHAP value|")
+plt.tight_layout()
+plt.show()
+
+print("\nTop 10 important features according to SHAP:")
+print(shap_importance_df.head(10))
+
+# ======================
+# 12. SAVE RESULTS SUMMARY
+# ======================
+results_table = pd.DataFrame({
+    "Model": ["Naive", "ExpSmooth", "LSTM", "Transformer"],
+    "RMSE":  [
+        baseline_results["Naive"]["RMSE"],
+        baseline_results["ExpSmooth"]["RMSE"],
+        lstm_results["RMSE"],
+        trans_results["RMSE"],
+    ],
+    "MAE":   [
+        baseline_results["Naive"]["MAE"],
+        baseline_results["ExpSmooth"]["MAE"],
+        lstm_results["MAE"],
+        trans_results["MAE"],
+    ],
+    "MAPE":  [
+        baseline_results["Naive"]["MAPE"],
+        baseline_results["ExpSmooth"]["MAPE"],
+        lstm_results["MAPE"],
+        trans_results["MAPE"],
+    ],
+    "MASE":  [
+        baseline_results["Naive"]["MASE"],
+        baseline_results["ExpSmooth"]["MASE"],
+        lstm_results["MASE"],
+        trans_results["MASE"],
+    ]
+})
+
+print("\n=== COMPARATIVE RESULTS TABLE ===")
+print(results_table)
+
+results_table.to_csv("model_comparison_results.csv", index=False)
+print("\nSaved metrics to model_comparison_results.csv")
